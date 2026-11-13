@@ -1,4 +1,4 @@
-use axum::{extract::{Path, State, Query}, http::{HeaderMap, StatusCode}, response::Html, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, State, Query}, http::{HeaderMap, StatusCode}, response::{Html, IntoResponse}, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -59,6 +59,9 @@ async fn export_excel(State(app):State<Arc<App>>, headers:HeaderMap, Query(filte
  let bytes=workbook.save_to_buffer().map_err(|_|internal())?;
  Ok(([(axum::http::header::CONTENT_TYPE,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),(axum::http::header::CONTENT_DISPOSITION,"attachment; filename=kurye-rapor.xlsx")],bytes))
 }
+async fn manifest()->impl IntoResponse { ([(axum::http::header::CONTENT_TYPE,"application/manifest+json")],include_str!("../static/manifest.webmanifest")) }
+async fn icon()->impl IntoResponse { ([(axum::http::header::CONTENT_TYPE,"image/svg+xml")],include_str!("../static/icon.svg")) }
+async fn service_worker()->impl IntoResponse { ([(axum::http::header::CONTENT_TYPE,"application/javascript"),(axum::http::header::CACHE_CONTROL,"no-cache")],include_str!("../static/sw.js")) }
 async fn homepage()->Html<&'static str>{Html(include_str!("../static/index.html"))}
 async fn health()->Json<Value>{Json(json!({"status":"ok"}))}
 async fn login(State(app):State<Arc<App>>,Json(input):Json<Login>)->ApiResult<Value>{
@@ -137,7 +140,7 @@ async fn history(State(app):State<Arc<App>>,headers:HeaderMap,Path(id):Path<Uuid
  let db=PgPool::connect(&url).await.expect("Postgres connection failed");
  sqlx::migrate!().run(&db).await.expect("Migrations failed");
  bootstrap_admin(&db).await;
- let app=Router::new().route("/",get(homepage)).route("/health",get(health)).route("/api/login",post(login)).route("/api/me",get(me))
+ let app=Router::new().route("/",get(homepage)).route("/manifest.webmanifest",get(manifest)).route("/icon.svg",get(icon)).route("/sw.js",get(service_worker)).route("/health",get(health)).route("/api/login",post(login)).route("/api/me",get(me))
  .route("/api/users",get(users).post(create_user)).route("/api/receipts",get(receipts).post(create_receipt)).route("/api/export.xlsx",get(export_excel))
  .route("/api/receipts/{id}/approve",post(approve)).route("/api/receipts/{id}/cancel",post(cancel))
  .route("/api/receipts/{id}/reactivate",post(reactivate)).route("/api/receipts/{id}/history",get(history))
