@@ -1,4 +1,4 @@
-use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, response::Html, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -25,6 +25,7 @@ async fn actor(db:&PgPool, headers:&HeaderMap)->Result<User,(StatusCode,Json<Val
  Ok(User{id:row.get("id"),full_name:row.get("full_name"),role:row.get("role")})
 }
 fn manager(user:&User)->Result<(),(StatusCode,Json<Value>)>{if user.role=="manager"{Ok(())}else{Err(err(StatusCode::FORBIDDEN,"Manager access required"))}}
+async fn homepage()->Html<&'static str>{Html(include_str!("../static/index.html"))}
 async fn health()->Json<Value>{Json(json!({"status":"ok"}))}
 async fn login(State(app):State<Arc<App>>,Json(input):Json<Login>)->ApiResult<Value>{
  let identifier=input.identifier.trim().to_lowercase();
@@ -101,7 +102,8 @@ async fn history(State(app):State<Arc<App>>,headers:HeaderMap,Path(id):Path<Uuid
  let url=env::var("DATABASE_URL").expect("DATABASE_URL required");
  let db=PgPool::connect(&url).await.expect("Postgres connection failed");
  sqlx::migrate!().run(&db).await.expect("Migrations failed");
- let app=Router::new().route("/health",get(health)).route("/api/login",post(login)).route("/api/me",get(me))
+ bootstrap_admin(&db).await;
+ let app=Router::new().route("/",get(homepage)).route("/health",get(health)).route("/api/login",post(login)).route("/api/me",get(me))
  .route("/api/users",get(users).post(create_user)).route("/api/receipts",get(receipts).post(create_receipt))
  .route("/api/receipts/{id}/approve",post(approve)).route("/api/receipts/{id}/cancel",post(cancel))
  .route("/api/receipts/{id}/reactivate",post(reactivate)).route("/api/receipts/{id}/history",get(history))
@@ -109,4 +111,14 @@ async fn history(State(app):State<Arc<App>>,headers:HeaderMap,Path(id):Path<Uuid
  let port=env::var("PORT").unwrap_or_else(|_|"3000".into());
  let listener=tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.expect("bind failed");
  axum::serve(listener,app).await.expect("server failed");
+}
+
+async fn bootstrap_admin(db:&PgPool){
+ let email=match env::var("INITIAL_ADMIN_EMAIL"){Ok(v) if !v.trim().is_empty()=>v.trim().to_lowercase(),_=>return};
+ let password=match env::var("INITIAL_ADMIN_PASSWORD"){Ok(v) if v.len()>=12=>v,_=>{eprintln!("INITIAL_ADMIN_PASSWORD must contain at least 12 characters");return}};
+ let name=env::var("INITIAL_ADMIN_NAME").unwrap_or_else(|_|"İlk Yönetici".into());
+ let hash=Argon2::default().hash_password(password.as_bytes(),&SaltString::generate(&mut OsRng)).expect("password hash").to_string();
+ let result=sqlx::query("INSERT INTO users(full_name,email,password_hash,role) SELECT $1,$2,$3,'manager' WHERE NOT EXISTS (SELECT 1 FROM users WHERE role='manager') ON CONFLICT DO NOTHING")
+ .bind(name).bind(email).bind(hash).execute(db).await;
+ if let Err(e)=result{eprintln!("Admin bootstrap failed: {e}");}
 }
