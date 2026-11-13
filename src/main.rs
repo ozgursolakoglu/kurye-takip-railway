@@ -1,4 +1,4 @@
-use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, response::Html, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, State, Query}, http::{HeaderMap, StatusCode}, response::Html, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -25,6 +25,40 @@ async fn actor(db:&PgPool, headers:&HeaderMap)->Result<User,(StatusCode,Json<Val
  Ok(User{id:row.get("id"),full_name:row.get("full_name"),role:row.get("role")})
 }
 fn manager(user:&User)->Result<(),(StatusCode,Json<Value>)>{if user.role=="manager"{Ok(())}else{Err(err(StatusCode::FORBIDDEN,"Manager access required"))}}
+#[derive(Deserialize)]
+struct ExportFilter { from: Option<chrono::NaiveDate>, to: Option<chrono::NaiveDate>, courier_id: Option<Uuid> }
+async fn export_excel(State(app):State<Arc<App>>, headers:HeaderMap, Query(filter):Query<ExportFilter>) -> Result<impl axum::response::IntoResponse,(StatusCode,Json<Value>)> {
+ let user=actor(&app.db,&headers).await?;
+ let rows=sqlx::query("SELECT r.receipt_number,r.receipt_date,c.full_name AS courier,r.payment_method,r.status,a.full_name AS approver,x.full_name AS canceller FROM receipts r JOIN users c ON c.id=r.courier_id LEFT JOIN users a ON a.id=r.approved_by LEFT JOIN users x ON x.id=r.cancelled_by WHERE ($1='manager' OR r.courier_id=$2) AND ($3::date IS NULL OR r.receipt_date >= $3) AND ($4::date IS NULL OR r.receipt_date <= $4) AND ($5::uuid IS NULL OR r.courier_id=$5) ORDER BY r.receipt_date DESC,r.receipt_number LIMIT 10000")
+ .bind(&user.role).bind(user.id).bind(filter.from).bind(filter.to).bind(filter.courier_id).fetch_all(&app.db).await.map_err(|_|internal())?;
+ let mut workbook=rust_xlsxwriter::Workbook::new();
+ let sheet=workbook.add_worksheet();
+ let headers=["Fiş No","Tarih","Kurye","Ödeme","Durum","Onaylayan Yönetici","İptal Eden Yönetici"];
+ for (col,title) in headers.iter().enumerate(){sheet.write_string(0,col as u16,*title).map_err(|_|internal())?;}
+ for (idx,row) in rows.iter().enumerate(){
+  let n=(idx+1) as u32;
+  let payment:String=row.get("payment_method");let status:String=row.get("status");
+  let values=[
+   row.get::<String,_>("receipt_number"),
+   row.get::<chrono::NaiveDate,_>("receipt_date").to_string(),
+   row.get::<String,_>("courier"),
+   match payment.as_str(){"cash"=>"Nakit","card"=>"Kart","meal"=>"Yemek çeki","iban"=>"IBAN",_=>&payment}.to_string(),
+   match status.as_str(){"pending"=>"Bekliyor","approved"=>"Onaylandı","cancelled"=>"İptal",_=>&status}.to_string(),
+   row.get::<Option<String>,_>("approver").unwrap_or_default(),
+   row.get::<Option<String>,_>("canceller").unwrap_or_default()
+  ];
+  for (col,value) in values.iter().enumerate(){sheet.write_string(n,col as u16,value).map_err(|_|internal())?;}
+ }
+ sheet.set_column_width(0,17).map_err(|_|internal())?;
+ sheet.set_column_width(1,15).map_err(|_|internal())?;
+ sheet.set_column_width(2,24).map_err(|_|internal())?;
+ sheet.set_column_width(3,16).map_err(|_|internal())?;
+ sheet.set_column_width(4,17).map_err(|_|internal())?;
+ sheet.set_column_width(5,25).map_err(|_|internal())?;
+ sheet.set_column_width(6,25).map_err(|_|internal())?;
+ let bytes=workbook.save_to_buffer().map_err(|_|internal())?;
+ Ok(([(axum::http::header::CONTENT_TYPE,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),(axum::http::header::CONTENT_DISPOSITION,"attachment; filename=kurye-rapor.xlsx")],bytes))
+}
 async fn homepage()->Html<&'static str>{Html(include_str!("../static/index.html"))}
 async fn health()->Json<Value>{Json(json!({"status":"ok"}))}
 async fn login(State(app):State<Arc<App>>,Json(input):Json<Login>)->ApiResult<Value>{
@@ -104,7 +138,7 @@ async fn history(State(app):State<Arc<App>>,headers:HeaderMap,Path(id):Path<Uuid
  sqlx::migrate!().run(&db).await.expect("Migrations failed");
  bootstrap_admin(&db).await;
  let app=Router::new().route("/",get(homepage)).route("/health",get(health)).route("/api/login",post(login)).route("/api/me",get(me))
- .route("/api/users",get(users).post(create_user)).route("/api/receipts",get(receipts).post(create_receipt))
+ .route("/api/users",get(users).post(create_user)).route("/api/receipts",get(receipts).post(create_receipt)).route("/api/export.xlsx",get(export_excel))
  .route("/api/receipts/{id}/approve",post(approve)).route("/api/receipts/{id}/cancel",post(cancel))
  .route("/api/receipts/{id}/reactivate",post(reactivate)).route("/api/receipts/{id}/history",get(history))
  .with_state(Arc::new(App{db}));
